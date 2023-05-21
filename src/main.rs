@@ -1,4 +1,5 @@
 use std::{collections::HashMap, time::Duration};
+use async_std::task::block_on;
 use garmata::SendResult;
 use clap::{Parser, ValueEnum};
 
@@ -21,7 +22,7 @@ struct CLI {
 fn main() {
     let cli = CLI::parse();
     let config = cli.configuration.unwrap_or("configuration.yaml".into());
-    match garmata::run(config) {
+    match block_on(garmata::run(config)) {
         Ok(results) => match cli.output.unwrap_or(Output::Stats) {
             Output::Csv  => summary_csv(&results),
             Output::Stats => summary_stats(&results)
@@ -31,21 +32,21 @@ fn main() {
 }
 
 fn summary_csv(results: &Vec<SendResult>) {
-    println!("start timestamp,response status,group,flow,total duration,DNS lookup,connect,TLS handshake,sending,waiting,download");
+    println!("start timestamp,response status,group,flow,total in μs,DNS lookup in μs,Connection in μs,TLS handshake in μs,sending in μs,waiting in μs,downloading in μs");
     for r in results {
         println!(
-            "{},{},{},{},{}ms,{}ms,{}ms,{}ms,{}ms,{}ms,{}ms",
+            "{},{},{},{},{},{},{},{},{},{},{}",
             r.start_timestamp,
             r.response_status,
             r.group,
             r.flow,
-            r.total_duration.as_millis(),
-            r.dns_duration.unwrap_or_default().as_millis(),
-            r.connect_duration.as_millis(),
-            r.tls_duration.unwrap_or_default().as_millis(),
-            r.sending_duration.as_millis(),
-            r.waiting_duration.as_millis(),
-            r.download_duration.as_millis(),
+            r.total_duration.as_micros(),
+            r.dns_duration.unwrap_or_default().as_micros(),
+            r.connect_duration.as_micros(),
+            r.tls_duration.unwrap_or_default().as_micros(),
+            r.sending_duration.as_micros(),
+            r.waiting_duration.as_micros(),
+            r.download_duration.as_micros(),
         );
     }
 }
@@ -75,8 +76,9 @@ fn summary_stats(results: &Vec<SendResult>) {
             }
         };
     }
-    for (playlist, map) in formatted {
-        println!("Group: {playlist}");
+    for (group, map) in &formatted {
+        let total = &formatted.get(group).unwrap().iter().map(|(_, timings)| timings.len()).sum::<usize>();
+        println!("Group: {group} ({total} requests total)");
         for (flow, durations) in map {
             println!("  Flow: {flow}");
             println!(

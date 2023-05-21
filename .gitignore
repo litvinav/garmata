@@ -1,7 +1,11 @@
 /target
+*.toml
+!/Cargo.toml
 /Cargo.lock
 *.md
 !/README.md
 *.html
 *.yaml
 .DS_Store
+*.sh
+.vscode

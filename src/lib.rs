@@ -4,6 +4,7 @@ use std::{
     str::FromStr,
     time::{Duration, Instant}, sync::{Arc, RwLock}, collections::HashMap,
 };
+use async_std::task::spawn;
 use native_tls::TlsConnector;
 use serde::Deserialize;
 use trust_dns_resolver::Resolver as DnsResolver;
@@ -29,6 +30,8 @@ pub struct Flow {
     pub name: String,
     pub path: String,
     pub method: String,
+    #[serde(default)]
+    pub body: String,
     #[serde(default)]
     pub headers: HashMap<String,String>,
     #[serde(default)]
@@ -63,7 +66,7 @@ pub struct SendResult {
 trait ReadAndWrite: Write + Read {}
 impl<T: Write + Read> ReadAndWrite for T {}
 
-fn send(http_version: &String, scheme: &String, target: &String, flow: &Flow, group_name: &String) -> Result<SendResult, GarmataError> {
+fn execute(http_version: &String, scheme: &String, target: &String, flow: &Flow, group_name: &String) -> Result<SendResult, GarmataError> {
     let start_timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let url = match Url::parse(&format!("{scheme}://{target}{path}", path = flow.path)) {
         Ok(url) => url,
@@ -172,12 +175,13 @@ fn request(stream: &mut Box<dyn ReadAndWrite>, url: &Url, flow: &Flow, version: 
         Host: {}\r\n\
         Accept: */*\r\n\
         Accept-Encoding: gzip, deflate, br\r\n\
-        {}\r\n",
+        {}\r\n{}",
         flow.method.to_uppercase(),
         url.path(),
         version,
         url.host_str().unwrap(),
-        flow.headers.iter().map(|(k,v)| format!("{k}: {v}\r\n")).collect::<Vec<String>>().join("")
+        flow.headers.iter().map(|(k,v)| format!("{k}: {v}\r\n")).collect::<Vec<String>>().join(""),
+        flow.body
     );
     let start = Instant::now();
     if stream.write_all(payload.as_bytes()).is_err() {
@@ -200,7 +204,7 @@ fn request(stream: &mut Box<dyn ReadAndWrite>, url: &Url, flow: &Flow, version: 
                     start = Instant::now();
                 }
                 payload.append(&mut chunk.to_vec());
-                if size == 0 || chunk.last() == Some(&0u8) || &payload.len() >= &8000 {
+                if size == 0 || chunk.last() == Some(&0u8) {
                     let download_duration = start.elapsed();
                     let payload = String::from_utf8_lossy(&payload).to_string();
                     let headline: String = payload.chars().take_while(|x| *x != '\r').collect();
@@ -213,46 +217,65 @@ fn request(stream: &mut Box<dyn ReadAndWrite>, url: &Url, flow: &Flow, version: 
     };
 }
 
-pub fn run(config: String) -> Result<Vec<SendResult>, GarmataError> {
+pub async fn run(config: String) -> Result<Vec<SendResult>, GarmataError> {
     let file = match std::fs::File::open(&config) {
         Ok(file) => file,
         Err(_) => return Err(GarmataError { reason: format!("file {} not found", &config) }),
     };
-    let config: Configuration = serde_yaml::from_reader(file).expect("invalid configuration content");
+    let config: Configuration = match serde_yaml::from_reader(file) {
+        Ok(config) => config,
+        Err(e) => return Err(GarmataError { reason: format!("Cannot parse {}: {}", &config, e.to_string()) }),
+    };
 
-    let mut todos = vec![];
+    let mut all_groups = vec![];
     let results = Arc::new(RwLock::new(Vec::new()));
     for entry in config.groups {
         let scheme = config.scheme.clone();
         let target = config.target.clone();
         let http_version = config.http_version.clone();
         let results = results.clone();
-
-        let handle = std::thread::spawn(move || {
-            let deadline = Instant::now().checked_add(Duration::from_secs(entry.duration)).expect("invalid duration provided!");
+        let deadline = match Instant::now().checked_add(Duration::from_secs(entry.duration)) {
+            Some(deadline) => deadline,
+            None => {
+                return Err(GarmataError { reason: format!("invalid duration provided for group {}", &entry.name) });
+            },
+        };
+        let handle = spawn(async move {
             loop {
                 if Instant::now() >= deadline {
                     break;
                 }
-                for flow in &entry.flow {
-                    match send(&http_version, &scheme, &target, flow, &entry.name) {
-                        Ok(result) => results.write().unwrap().push(result),
-                        Err(e) => { // exit group only
-                            eprintln!("{}", e.reason);
-                            break;
-                        },
-                    }
+                let mut all_user_flows = vec![];
+                for _ in 0..entry.users {
+                    let flows = entry.flow.clone();
+                    let http_version = http_version.clone();
+                    let scheme = scheme.clone();
+                    let target = target.clone();
+                    let group_name = entry.name.clone();
+                    let results = results.clone();
+                    let handle = spawn(async move {
+                        for flow in &flows {
+                            match execute(&http_version, &scheme, &target, flow, &group_name) {
+                                Ok(result) => results.write().unwrap().push(result),
+                                Err(e) => {
+                                    eprintln!("{}", e.reason);
+                                    break;
+                                },
+                            }
+                        }
+                    });
+                    all_user_flows.push(handle);
+                }
+                for user_flow in all_user_flows {
+                    user_flow.await
                 }
             }
         });
-        todos.push(handle);
+        all_groups.push(handle);
     }
 
-    // Await all
-    for todo in todos {
-        if let Err(_) = todo.join() {
-            return Err(GarmataError { reason: "Could not join on the associated thread".into() })
-        }
+    for group in all_groups {
+        group.await
     }
     // Return only the results
     let results = results.read().unwrap().as_slice().to_vec();
