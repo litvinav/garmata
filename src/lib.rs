@@ -2,20 +2,15 @@ use std::{
     io::{Write, Read},
     net::{IpAddr, TcpStream},
     str::FromStr,
-    time::{Duration, Instant}, sync::{Arc, RwLock},
+    time::{Duration, Instant}, sync::{Arc, RwLock}, collections::HashMap,
 };
 use native_tls::TlsConnector;
 use serde::Deserialize;
 use trust_dns_resolver::Resolver as DnsResolver;
 use url::Url;
 
-pub struct Phase {
-    pub arrival_rate: u64,
-    pub duration: u64,
-}
-
 fn default_scheme() -> String { "https".into() }
-fn default_http_version() -> String { "2".into() }
+fn default_http_version() -> String { "1.1".into() }
 fn default_users() -> usize { 1 }
 
 #[derive(Deserialize)]
@@ -25,7 +20,7 @@ pub struct Configuration {
     #[serde(default = "default_http_version")]
     pub http_version: String,
     pub target: String,
-    pub playlist: Vec<Playlist>,
+    pub groups: Vec<Group>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -35,11 +30,13 @@ pub struct Flow {
     pub path: String,
     pub method: String,
     #[serde(default)]
+    pub headers: HashMap<String,String>,
+    #[serde(default)]
     pub insecure: bool,
 }
 
 #[derive(Deserialize, Clone)]
-pub struct Playlist {
+pub struct Group {
     #[serde(default)]
     pub name: String,
     #[serde(default = "default_users")]
@@ -60,6 +57,7 @@ pub struct SendResult {
     pub waiting_duration: Duration,
     pub download_duration: Duration,
     pub total_duration: Duration,
+    pub response_status: String,
 }
 
 trait ReadAndWrite: Write + Read {}
@@ -67,7 +65,10 @@ impl<T: Write + Read> ReadAndWrite for T {}
 
 fn send(http_version: &String, scheme: &String, target: &String, flow: &Flow, group_name: &String) -> Result<SendResult, GarmataError> {
     let start_timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let url = Url::parse(&format!("{scheme}://{target}{path}", path = flow.path)).unwrap();
+    let url = match Url::parse(&format!("{scheme}://{target}{path}", path = flow.path)) {
+        Ok(url) => url,
+        Err(e) => return Err(GarmataError { reason: e.to_string() }),
+    };
 
     let (addr, dns_duration) = dns_resolve(&url)?;
 
@@ -76,7 +77,7 @@ fn send(http_version: &String, scheme: &String, target: &String, flow: &Flow, gr
 
     let (mut stream, tls_duration) = tls_handshake(stream, &url, flow.insecure)?;
 
-    let (sending_duration, waiting_duration, download_duration) = request(&mut stream, &url, &flow.method, http_version)?;
+    let (sending_duration, waiting_duration, download_duration, response_status) = request(&mut stream, &url, &flow, http_version)?;
 
     Ok(SendResult {
         group: group_name.clone(),
@@ -86,9 +87,10 @@ fn send(http_version: &String, scheme: &String, target: &String, flow: &Flow, gr
         connect_duration,
         tls_duration,
         sending_duration,
-        // Todo: redirect_duration
         waiting_duration,
         download_duration,
+        // Todo: redirect_duration if response_status 301 or 308
+        response_status,
         total_duration:
             if dns_duration.is_none() { Duration::from_secs(0) } else { dns_duration.unwrap() }
             + connect_duration
@@ -164,17 +166,18 @@ fn tls_handshake(stream: TcpStream, url: &Url, allow_insecure_certificates: bool
     }
 }
 
-fn request(stream: &mut Box<dyn ReadAndWrite>, url: &Url, method: &String, version: &String) -> Result<(Duration, Duration, Duration), GarmataError> {
+fn request(stream: &mut Box<dyn ReadAndWrite>, url: &Url, flow: &Flow, version: &String) -> Result<(Duration, Duration, Duration, String), GarmataError> {
     let payload = format!(
         "{} {} HTTP/{}\r\n\
         Host: {}\r\n\
         Accept: */*\r\n\
         Accept-Encoding: gzip, deflate, br\r\n\
-        \r\n",
-        method.to_uppercase(),
-        version,
+        {}\r\n",
+        flow.method.to_uppercase(),
         url.path(),
-        url.host_str().unwrap()
+        version,
+        url.host_str().unwrap(),
+        flow.headers.iter().map(|(k,v)| format!("{k}: {v}\r\n")).collect::<Vec<String>>().join("")
     );
     let start = Instant::now();
     if stream.write_all(payload.as_bytes()).is_err() {
@@ -185,20 +188,24 @@ fn request(stream: &mut Box<dyn ReadAndWrite>, url: &Url, method: &String, versi
     };
     let sending_duration = start.elapsed();
 
-    
     let mut start = Instant::now();
     let mut waiting_duration = None;
+    let mut payload: Vec<u8> = vec![];
     loop {
-        let mut one_byte_buf = [0_u8];
-        match stream.read(&mut one_byte_buf) {
+        let mut chunk = [0u8; 32];
+        match stream.read(&mut chunk) {
             Ok(size) => {
                 if waiting_duration.is_none() {
                     waiting_duration = Some(start.elapsed());
                     start = Instant::now();
                 }
-                if size == 0  {
+                payload.append(&mut chunk.to_vec());
+                if size == 0 || chunk.last() == Some(&0u8) || &payload.len() >= &8000 {
                     let download_duration = start.elapsed();
-                    return Ok((sending_duration, waiting_duration.unwrap(), download_duration))
+                    let payload = String::from_utf8_lossy(&payload).to_string();
+                    let headline: String = payload.chars().take_while(|x| *x != '\r').collect();
+                    let response_status = headline.split(' ').nth(1).unwrap().to_string();
+                    return Ok((sending_duration, waiting_duration.unwrap(), download_duration, response_status))
                 }
             },
             Err(_) => return Err(GarmataError { reason: "could not read the server's response".into() }),
@@ -206,13 +213,16 @@ fn request(stream: &mut Box<dyn ReadAndWrite>, url: &Url, method: &String, versi
     };
 }
 
-pub fn run(config: String) -> Vec<SendResult> {
-    let file = std::fs::File::open(&config).expect(format!("no {} file found!", &config).as_str());
-    let config: Configuration = serde_yaml::from_reader(file).expect("invalid configuration");
+pub fn run(config: String) -> Result<Vec<SendResult>, GarmataError> {
+    let file = match std::fs::File::open(&config) {
+        Ok(file) => file,
+        Err(_) => return Err(GarmataError { reason: format!("file {} not found", &config) }),
+    };
+    let config: Configuration = serde_yaml::from_reader(file).expect("invalid configuration content");
 
     let mut todos = vec![];
     let results = Arc::new(RwLock::new(Vec::new()));
-    for entry in config.playlist {
+    for entry in config.groups {
         let scheme = config.scheme.clone();
         let target = config.target.clone();
         let http_version = config.http_version.clone();
@@ -227,7 +237,10 @@ pub fn run(config: String) -> Vec<SendResult> {
                 for flow in &entry.flow {
                     match send(&http_version, &scheme, &target, flow, &entry.name) {
                         Ok(result) => results.write().unwrap().push(result),
-                        Err(e) => panic!("{}", e.reason),
+                        Err(e) => { // exit group only
+                            eprintln!("{}", e.reason);
+                            break;
+                        },
                     }
                 }
             }
@@ -237,9 +250,11 @@ pub fn run(config: String) -> Vec<SendResult> {
 
     // Await all
     for todo in todos {
-        todo.join().expect("Could not join on the associated thread");
+        if let Err(_) = todo.join() {
+            return Err(GarmataError { reason: "Could not join on the associated thread".into() })
+        }
     }
     // Return only the results
     let results = results.read().unwrap().as_slice().to_vec();
-    results
+    Ok(results)
 }
