@@ -1,122 +1,34 @@
+pub mod configuration;
+pub mod http;
+
+use async_std::task::spawn;
+use configuration::*;
 use std::{
     io::{Write, Read},
     net::{IpAddr, TcpStream},
     str::FromStr,
-    time::{Duration, Instant}, sync::{Arc, RwLock}, collections::HashMap,
+    time::{Duration, Instant}, sync::{Arc, RwLock},
 };
-use async_std::task::spawn;
+use http::*;
 use native_tls::TlsConnector;
-use serde::Deserialize;
 use trust_dns_resolver::Resolver as DnsResolver;
 use url::Url;
-
-fn default_scheme() -> String { "https".into() }
-fn default_http_version() -> String { "1.1".into() }
-fn default_users() -> usize { 1 }
-
-#[derive(Deserialize)]
-pub struct Configuration { 
-    #[serde(default = "default_scheme")]
-    pub scheme: String,
-    #[serde(default = "default_http_version")]
-    pub http_version: String,
-    pub target: String,
-    pub groups: Vec<Group>,
-}
-
-#[derive(Deserialize, Clone)]
-pub struct Flow {
-    #[serde(default)]
-    pub name: String,
-    pub path: String,
-    pub method: String,
-    #[serde(default)]
-    pub body: String,
-    #[serde(default)]
-    pub headers: HashMap<String,String>,
-    #[serde(default)]
-    pub insecure: bool,
-}
-
-#[derive(Deserialize, Clone)]
-pub struct Group {
-    #[serde(default)]
-    pub name: String,
-    #[serde(default = "default_users")]
-    pub users: usize,
-    pub duration: u64,
-    pub flow: Vec<Flow>
-}
-
-#[derive(Debug, Clone)]
-pub struct SendResult {
-    pub group: String,
-    pub flow: String,
-    pub start_timestamp: String,
-    pub dns_duration: Option<Duration>,
-    pub connect_duration: Duration,
-    pub tls_duration: Option<Duration>,
-    pub sending_duration: Duration,
-    pub waiting_duration: Duration,
-    pub download_duration: Duration,
-    pub total_duration: Duration,
-    pub response_status: String,
-}
-
-trait ReadAndWrite: Write + Read {}
-impl<T: Write + Read> ReadAndWrite for T {}
-
-fn execute(http_version: &String, scheme: &String, target: &String, flow: &Flow, group_name: &String) -> Result<SendResult, GarmataError> {
-    let start_timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let url = match Url::parse(&format!("{scheme}://{target}{path}", path = flow.path)) {
-        Ok(url) => url,
-        Err(e) => return Err(GarmataError { reason: e.to_string() }),
-    };
-
-    let (addr, dns_duration) = dns_resolve(&url)?;
-
-    let port = url.port_or_known_default().unwrap();
-    let (stream, connect_duration) = tcp_connect(addr, port)?;
-
-    let (mut stream, tls_duration) = tls_handshake(stream, &url, flow.insecure)?;
-
-    let (sending_duration, waiting_duration, download_duration, response_status) = request(&mut stream, &url, &flow, http_version)?;
-
-    Ok(SendResult {
-        group: group_name.clone(),
-        flow: flow.name.clone(),
-        start_timestamp,
-        dns_duration,
-        connect_duration,
-        tls_duration,
-        sending_duration,
-        waiting_duration,
-        download_duration,
-        // Todo: redirect_duration if response_status 301 or 308
-        response_status,
-        total_duration:
-            if dns_duration.is_none() { Duration::from_secs(0) } else { dns_duration.unwrap() }
-            + connect_duration
-            + if tls_duration.is_none() { Duration::from_secs(0) } else { tls_duration.unwrap() }
-            + sending_duration
-            + waiting_duration
-            + download_duration
-    })
-}
 
 #[derive(Debug)]
 pub struct GarmataError {
     pub reason: String,
 }
+trait ReadAndWrite: Write + Read {}
+impl<T: Write + Read> ReadAndWrite for T {}
 
-fn dns_resolve(url: &Url) -> Result<(IpAddr, Option<Duration>), GarmataError> {
+fn dns_resolve(url: &Url) -> Result<(IpAddr, Duration), GarmataError> {
     if url.domain().is_none() {
         let mut ip_str = url.host_str().unwrap();
         if ip_str.starts_with('[') {
             ip_str = &ip_str[1..ip_str.len() - 1];
         }
         match IpAddr::from_str(ip_str) {
-            Ok(addr) => Ok((addr, None)),
+            Ok(addr) => Ok((addr, Duration::default())),
             Err(e) => Err(GarmataError { reason: e.to_string() }),
         }
     } else {
@@ -127,7 +39,7 @@ fn dns_resolve(url: &Url) -> Result<(IpAddr, Option<Duration>), GarmataError> {
         match result {
             Ok(response) => {
                 if let Some(addr) = response.iter().find(|i| i.is_ipv4() || i.is_ipv6()) {
-                    Ok((addr, Some(duration)))
+                    Ok((addr, duration))
                 } else {
                     Err(GarmataError { reason: "unresolved hostname".into() })
                 }
@@ -148,7 +60,7 @@ fn tcp_connect(addr: IpAddr, port: u16) -> Result<(TcpStream, Duration), Garmata
     }
 }
 
-fn tls_handshake(stream: TcpStream, url: &Url, allow_insecure_certificates: bool) -> Result<(Box<dyn ReadAndWrite> , Option<Duration>), GarmataError> {
+fn tls_handshake(stream: TcpStream, url: &Url, allow_insecure_certificates: bool) -> Result<(Box<dyn ReadAndWrite> , Duration), GarmataError> {
     if url.scheme() == "https" {
         let tls_connector = TlsConnector::builder()
             .danger_accept_invalid_hostnames(allow_insecure_certificates)
@@ -159,17 +71,17 @@ fn tls_handshake(stream: TcpStream, url: &Url, allow_insecure_certificates: bool
         let start = Instant::now();
         match tls_connector.connect(domain, stream) {
             Ok(mut stream) => match stream.flush() {
-                Ok(_) => Ok((Box::new(stream), Some(start.elapsed()))),
+                Ok(_) => Ok((Box::new(stream), start.elapsed())),
                 Err(_) => Err(GarmataError { reason: format!("unexpected I/O errors while tls handshake to {domain}") }),
             },
             Err(_) => Err(GarmataError { reason: format!("cannot establish a tls handshake to {domain}") }),
         }
     } else {
-        Ok((Box::new(stream), None))
+        Ok((Box::new(stream), Duration::default()))
     }
 }
 
-fn request(stream: &mut Box<dyn ReadAndWrite>, url: &Url, flow: &Flow, version: &String) -> Result<(Duration, Duration, Duration, String), GarmataError> {
+fn request(stream: &mut Box<dyn ReadAndWrite>, url: &Url, flow: &Flow, version: &String) -> Result<(Duration, Duration, Duration, HttpResponse), GarmataError> {
     let payload = format!(
         "{} {} HTTP/{}\r\n\
         Host: {}\r\n\
@@ -206,10 +118,10 @@ fn request(stream: &mut Box<dyn ReadAndWrite>, url: &Url, flow: &Flow, version: 
                 payload.append(&mut chunk.to_vec());
                 if size == 0 || chunk.last() == Some(&0u8) {
                     let download_duration = start.elapsed();
-                    let payload = String::from_utf8_lossy(&payload).to_string();
-                    let headline: String = payload.chars().take_while(|x| *x != '\r').collect();
-                    let response_status = headline.split(' ').nth(1).unwrap().to_string();
-                    return Ok((sending_duration, waiting_duration.unwrap(), download_duration, response_status))
+                    match HttpResponse::from_payload(String::from_utf8_lossy(&payload)) {
+                        Some(response) => return Ok((sending_duration, waiting_duration.unwrap(), download_duration, response)),
+                        None => return Err(GarmataError { reason: format!("could not parse http response for {}", url.as_str()) })
+                    }
                 }
             },
             Err(_) => return Err(GarmataError { reason: "could not read the server's response".into() }),
@@ -217,7 +129,61 @@ fn request(stream: &mut Box<dyn ReadAndWrite>, url: &Url, flow: &Flow, version: 
     };
 }
 
-pub async fn run(config: String) -> Result<Vec<SendResult>, GarmataError> {
+fn execute(http_version: &String, scheme: &String, target: &String, flow: &Flow, group_name: &String, max_redirects: u32) -> Result<HttpResult, GarmataError> {
+    let start_timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut url = match Url::parse(&format!("{scheme}://{target}{path}", path = flow.path)) {
+        Ok(url) => url,
+        Err(e) => return Err(GarmataError { reason: e.to_string() }),
+    };
+
+    let (addr, dns_duration) = dns_resolve(&url)?;
+
+    let port = url.port_or_known_default().unwrap();
+    let (stream, connect_duration) = tcp_connect(addr, port)?;
+
+    let (mut stream, tls_duration) = tls_handshake(stream, &url, flow.insecure)?;
+
+    let mut redirects = 0;
+    let mut redirect_duration = Duration::from_secs(0);
+    loop {
+        let (sending_duration, waiting_duration, download_duration, response) = request(&mut stream, &url, &flow, http_version)?;
+
+        if redirects == max_redirects || !["301", "302", "308"].contains(&response.status.as_str()) {
+            return Ok(HttpResult {
+                group: group_name.clone(),
+                flow: flow.name.clone(),
+                start_timestamp,
+                dns_duration,
+                connect_duration,
+                tls_duration,
+                sending_duration,
+                waiting_duration,
+                download_duration,
+                redirect_duration,
+                response_status: response.status,
+                total_duration:
+                    dns_duration
+                    + connect_duration
+                    + tls_duration
+                    + redirect_duration
+                    + sending_duration
+                    + waiting_duration
+                    + download_duration
+            });
+        }
+        let location = response.headers.get("location").unwrap(); // expected due to status code
+        if location.starts_with("http") {
+            url = Url::parse(&location).unwrap();
+        } else {
+            url.set_path(location)
+        }
+
+        redirect_duration += sending_duration + waiting_duration + download_duration;
+        redirects += 1;
+    }
+}
+
+pub async fn run(config: String) -> Result<Vec<HttpResult>, GarmataError> {
     let file = match std::fs::File::open(&config) {
         Ok(file) => file,
         Err(_) => return Err(GarmataError { reason: format!("file {} not found", &config) }),
@@ -247,15 +213,16 @@ pub async fn run(config: String) -> Result<Vec<SendResult>, GarmataError> {
                 }
                 let mut all_user_flows = vec![];
                 for _ in 0..entry.users {
-                    let flows = entry.flow.clone();
                     let http_version = http_version.clone();
                     let scheme = scheme.clone();
                     let target = target.clone();
                     let group_name = entry.name.clone();
+                    let max_redirects = entry.max_redirects.clone();
+                    let flows = entry.flow.clone();
                     let results = results.clone();
                     let handle = spawn(async move {
                         for flow in &flows {
-                            match execute(&http_version, &scheme, &target, flow, &group_name) {
+                            match execute(&http_version, &scheme, &target, flow, &group_name, max_redirects) {
                                 Ok(result) => results.write().unwrap().push(result),
                                 Err(e) => {
                                     eprintln!("{}", e.reason);

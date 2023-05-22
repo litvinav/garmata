@@ -1,6 +1,6 @@
 use std::{collections::HashMap, time::Duration};
 use async_std::task::block_on;
-use garmata::SendResult;
+use garmata::http::HttpResult;
 use clap::{Parser, ValueEnum};
 
 #[derive(Clone, ValueEnum)]
@@ -31,19 +31,20 @@ fn main() {
     };
 }
 
-fn summary_csv(results: &Vec<SendResult>) {
-    println!("start timestamp,response status,group,flow,total in μs,DNS lookup in μs,Connection in μs,TLS handshake in μs,sending in μs,waiting in μs,downloading in μs");
+fn summary_csv(results: &Vec<HttpResult>) {
+    println!("start timestamp,response status,group,flow,total in μs,DNS lookup in μs,Connection in μs,TLS handshake in μs,redirecting in μs,sending in μs,waiting in μs,downloading in μs");
     for r in results {
         println!(
-            "{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
             r.start_timestamp,
             r.response_status,
             r.group,
             r.flow,
             r.total_duration.as_micros(),
-            r.dns_duration.unwrap_or_default().as_micros(),
+            r.dns_duration.as_micros(),
             r.connect_duration.as_micros(),
-            r.tls_duration.unwrap_or_default().as_micros(),
+            r.tls_duration.as_micros(),
+            r.redirect_duration.as_micros(),
             r.sending_duration.as_micros(),
             r.waiting_duration.as_micros(),
             r.download_duration.as_micros(),
@@ -51,7 +52,7 @@ fn summary_csv(results: &Vec<SendResult>) {
     }
 }
 
-fn summary_stats(results: &Vec<SendResult>) {
+fn summary_stats(results: &Vec<HttpResult>) {
     let mut formatted: HashMap<String, HashMap<String, Vec<Duration>>> = HashMap::new();
     for r in results {
         match formatted.get_mut(&r.group) {

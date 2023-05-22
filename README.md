@@ -9,6 +9,19 @@
 
 Either get a prebuild version from the assets in the [Releases page](https://github.com/litvinav/garmata/releases) or build a executable from source files.
 
+<details>
+<summary>Help me to setup the executable</summary>
+Download the executable fit for your system based on the name and rename it to garmata for Unix or garmata.exe for Windows.
+Only x86_64 versions are present in the Releases page. Thanks to Rosetta you can still use it on your M1 or M2 Mac.
+
+For Unix systems you have to give the binary file executable permissions to make it a executable: `chmod +x ./x86_64-release-name` 
+Either place the binary in `/usr/bin/garmata` or store it user scoped in your home folder `~/bin/garmata`.
+
+For Windows you can store the executable in e.g. `C:\Program Files\litvinav\garmata.exe` and you want to make sure the executable is located in one of the directories reachable by the PATH variable. If the location is referenced via PATH, you can execute `garmata.exe --help` in cmd or PowerShell.
+
+Don't forget to add the executable location to the PATH variable either way. Of course you can call it directly via the full path to the executable for one-off usage.
+</details>
+
 # Usage
 
 Run garmata with the `--help` flag to see the usage instructions.
@@ -20,8 +33,19 @@ garmata
 ```sh
 # Collect performance data for test configured in "./test.yaml" and output as csv into results.csv
 garmata -o csv ./test.yaml 1> results.csv
+# Analyze the output in the program of your choice.
+libreoffice.calc results.csv  
 ```
 
+Minimal configuration file:
+```yaml
+target: example.com
+groups:
+- duration: 10
+  flow:
+  - path: /
+    method: GET
+```
 Example configuration file:
 ```yaml
 scheme: https # http or https only atm; default is https if not provided
@@ -30,6 +54,7 @@ http_version: "1.1" # default is 1.1 if not provided
 groups:
 - name: API Backend # optional name for stats group
   users: 2 # default is 1 if not provided
+  max_redirects: 1 # default is 50 if not provided
   duration: 10 # duration in seconds
   flow:
   - name: Profile edit route # optional name for stats group
