@@ -1,17 +1,21 @@
-use std::{collections::HashMap, time::Duration};
+// MIT License - free as in freedom; Full license in the LICENSE file
 use async_std::task::block_on;
-use garmata::http::HttpResult;
 use clap::{Parser, ValueEnum};
+use garmata::http::HttpResult;
+use std::{collections::HashMap, time::Duration};
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, ValueEnum, PartialEq, Eq)]
 enum Output {
     Stats,
-    Csv
+    Csv,
+    Debug,
 }
 
 #[derive(Parser)]
-struct CLI {
-    /// Location of the configuration file [default: ./configuration.yaml]
+#[command(author, version, about, long_about = None)]
+#[command(propagate_version = true)]
+struct Cli {
+    /// Location of the test configuration file [default: ./configuration.yaml]
     configuration: Option<String>,
 
     #[arg(short, long, value_enum)]
@@ -20,12 +24,14 @@ struct CLI {
 }
 
 fn main() {
-    let cli = CLI::parse();
+    let cli = Cli::parse();
     let config = cli.configuration.unwrap_or("configuration.yaml".into());
-    match block_on(garmata::run(config)) {
+    let is_debug = cli.output == Some(Output::Debug);
+    match block_on(garmata::run(config, is_debug)) {
         Ok(results) => match cli.output.unwrap_or(Output::Stats) {
-            Output::Csv  => summary_csv(&results),
-            Output::Stats => summary_stats(&results)
+            Output::Csv => summary_csv(&results),
+            Output::Stats => summary_stats(&results),
+            Output::Debug => {},
         },
         Err(e) => eprintln!("{}", e.reason),
     };
@@ -78,8 +84,9 @@ fn summary_stats(results: &Vec<HttpResult>) {
         };
     }
     for (group, map) in &formatted {
-        let total = &formatted.get(group).unwrap().iter().map(|(_, timings)| timings.len()).sum::<usize>();
-        println!("Group: {group} ({total} requests total)");
+        let total = &map.iter().map(|(_, timings)| timings.len()).sum::<usize>();
+        let pad = if group.is_empty() { "" } else { " " };
+        println!("Group: {group}{pad}({total} requests total)");
         for (flow, durations) in map {
             println!("  Flow: {flow}");
             println!(
@@ -95,20 +102,12 @@ fn summary_stats(results: &Vec<HttpResult>) {
             println!(
                 "    {:.<68} {}s",
                 "p50: ",
-                durations
-                    .iter()
-                    .nth(durations.len() / 2)
-                    .unwrap()
-                    .as_secs_f32()
+                durations[durations.len() / 2].as_secs_f32()
             );
             println!(
                 "    {:.<68} {}s",
                 "p95: ",
-                durations
-                    .iter()
-                    .nth((((durations.len() - 1) as f32) * 0.95).floor() as usize)
-                    .unwrap()
-                    .as_secs_f32()
+                durations[((durations.len() as f32) * 0.95).floor() as usize].as_secs_f32()
             );
             println!(
                 "    {:.<68} {}s",
