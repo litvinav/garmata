@@ -1,0 +1,2 @@
+# Contents
+- [Redirects](redirects.md)
