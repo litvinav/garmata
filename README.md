@@ -3,7 +3,7 @@
 </p>
 🔫 Garmata (Cyrillic: гармата, [ˈɡɑrmɑtɑ], weapon in Belarusian) is a headless, self contained and minimalistic performance testing tool to put a system under load.
 
-> This project is work-in-progress and may introduce big and breaking changes between versions. Minor and Patch changes may rename or restructure parts of this tool. Please consult the help page with the `--help` flag for your executable or the doc pages for the usage of the current version.
+> This project is work-in-progress. Please consult the help page with the `--help` flag for your executable or the doc pages for the usage of the current version.
 
 # How to install
 
@@ -28,7 +28,7 @@ garmata
 ```
 ```sh
 # Perform the test configured in "./configuration.yaml" and print the requests and responses to stdout
-garmata -o debug
+garmata --output debug
 ```
 ```sh
 # Collect performance data for test configured in "./test.yaml" and output as csv into results.csv
@@ -62,9 +62,9 @@ groups:
     max_redirects: 10 # max for one iteration; default is 0 if not provided
     method: POST # any http method; uppercased but not validated (check for typos)
     body: '{ "hello": "world" }' # optional
-    insecure: false # default is false if not provided; allows insecure/self-signed certificates if true
+    insecure: false # if not provided false; allows insecure/self-signed certificates if true
     headers: # optional
-      # Garmata sets 2 common browser headers but override is possible. In case of duplicates the last wins.
+      # 2 common headers are set but override is possible. For duplicates the last key wins.
       accept: application/json # default is "*/*" as in most browsers
       accept-encoding: "" # default is "gzip, deflate, br" as in most browsers
     cookies: # optional; response set-cookie syntax (for easy copy paste)
